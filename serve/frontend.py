@@ -1157,6 +1157,9 @@ def parse_tool_call(body: str, schema: dict | None = None, notes: list | None = 
 RCALL_MAX = 32768        # the most of a `<tool_call>` inside the reasoning that is held while waiting for its end (#804)
 
 
+_TOOL_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_.:-]{0,127}")
+
+
 class OutputParser:
     """Incremental parser of the model's text. Feed deltas; get events. A tag split across deltas is held back
     until it is complete, so clients never see `<tool_` or `</thi`."""
@@ -1249,7 +1252,12 @@ class OutputParser:
         none declared, only where `declared_only` is off."""
         if not self.schemas:
             return not self.declared_only
-        return name in self.schemas or name in self.aliases or self.deferred
+        if name in self.schemas or name in self.aliases or self.deferred:
+            return True
+        # A client that declares ToolSearch (Claude Code with tool search on) holds deferred tools it did not
+        # declare and runs them by name, or answers an unknown one with an error the model can act on.  As text the
+        # call reaches neither, and the model retries it.
+        return "ToolSearch" in self.schemas and _TOOL_NAME.fullmatch(name) is not None
 
     def _loose_open(self, after: str):
         """#3441: `after` (text after a `<tool_call>`, whitespace dropped) opens a call in a drifted form that names a
