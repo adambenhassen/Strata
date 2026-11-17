@@ -471,6 +471,11 @@ if(STRATA_BUILD_TESTS)
   target_include_directories(plain_floor_rule_test PRIVATE include)
   add_test(NAME plain_floor_rule_test COMMAND plain_floor_rule_test)
 
+  # the staged walk's relay through the other card of a layer split: switch, share, per-chunk rule (header-only, no GPU)
+  add_executable(split_relay_rule_test tests/prefill/split_relay_rule_test.cpp)
+  target_include_directories(split_relay_rule_test PRIVATE include)
+  add_test(NAME split_relay_rule_test COMMAND split_relay_rule_test)
+
   # the start-up sentence of an engine built without llama.cpp's MMQ prompt kernels (layer counts per path; header-only, no GPU)
   add_executable(own_only_line_test tests/prefill/own_only_line_test.cpp)
   target_include_directories(own_only_line_test PRIVATE include)
