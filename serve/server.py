@@ -5194,12 +5194,15 @@ class Service:
 
     def reasoning_budget(self, req) -> int | None:
         """#123: the most tokens this request may think, or None: the request's `reasoning_budget_tokens` (or, as
-        llama.cpp reads it, `thinking_budget_tokens`), else the config's.  0 (or less) means no budget, so a request can
+        llama.cpp reads it, `thinking_budget_tokens`; or vLLM's `thinking_token_budget`, or Qwen's `thinking_budget`: the
+        three names pi's thinkingTokenBudgetField can send), else the config's.  The request's own `reasoning_budget_tokens`
+        wins; of the other names the first in that order does.  0 (or less) means no budget, so a request can
         turn a configured one off.  ValueError (a 400) for anything that is not a whole number."""
         req = req if isinstance(req, dict) else {}
         value = req.get("reasoning_budget_tokens")
-        if value is None:                                # a null does not hide the other name
-            value = req.get("thinking_budget_tokens")
+        for alias in ("thinking_token_budget", "thinking_budget", "thinking_budget_tokens"):
+            if value is None:                            # a null does not hide the other names
+                value = req.get(alias)
         if value is None:
             value = self.reasoning_budget_tokens
         if isinstance(value, float) and value.is_integer():
@@ -6872,6 +6875,10 @@ class Service:
                 "reasoning_recoveries": recovery_count}
         if stops is not None and stops.hit is not None:
             done["stop_sequence"] = stops.hit
+            if finish == "length":
+                # #4035: the stop string was found and cut from the answer, so the answer ended at it: "stop", not the token cap that fell on the
+                # same token (the Anthropic route already says stop_sequence)
+                done["finish"] = "stop"
         if rejected:
             done["rejected_tool_calls"] = rejected
         if markup_retried is not None:
@@ -7543,7 +7550,9 @@ def openai_collect(chunks) -> dict:
     calls = [by_index[i] for i in sorted(by_index)]
     if last["choices"][0]["finish_reason"] != "tool_calls":
         calls = [c for c in calls if _is_json(c["function"]["arguments"])]   # a call the output ended inside (#211)
-    msg = {"role": "assistant", "content": "".join(content) or None}
+    # null content only beside tool calls, as OpenAI sends it; a reply that ran out of tokens while thinking gets ""
+    # so strict OpenAI clients and proxies that require a string do not fail on it.
+    msg = {"role": "assistant", "content": "".join(content) or (None if calls else "")}
     if "".join(reasoning).strip() and "".join(reasoning).strip() == "".join(content).strip():
         reasoning = []              # a turn with no </think>: the text is the answer; it is not also reasoning
     if "".join(reasoning):
@@ -8637,9 +8646,20 @@ def make_handler(svc: Service):
 
             except ClientGone:                               # #1999: the client left while the request was prepared
                 self._note(outcome="disconnected")
-            except OSError:
+            except (ConnectionError, TimeoutError):
                 self._note(outcome="disconnected")
                 raise                                        # as before #332: the server's own handling
+            except BadBody:
+                raise
+            except Exception as e:
+                if getattr(self, "answer_started", False):
+                    raise
+                import traceback
+                print(f"[strata] 500 internal error ({type(e).__name__}: {e}):\n" + traceback.format_exc(), flush=True)
+                self._note(error=f"{type(e).__name__}: {e}")
+                message = f"internal server error ({type(e).__name__}: {e})"
+                self._json(500, responses_error_body(message, "server_error") if path == "/v1/responses"
+                           else {"error": {"type": "server_error", "message": message}})
             finally:
                 if reserved:
                     svc.release_inference()
@@ -10082,25 +10102,63 @@ def with_component_engine(cfg: dict) -> dict:
 def _history_call_names(req) -> list:
     """The tool names a request's own conversation called, in order, on any of the three routes: Chat Completions (an assistant
     message's tool_calls), Anthropic (an assistant message's tool_use blocks) and Responses (function_call / custom_tool_call
-    input items, a namespace in front as `namespace.name`)."""
+    input items, a namespace in front as `namespace.name`).  #6120: a name every call of which the client REFUSED (its result says the tool does not
+    exist: `AI_NoSuchToolError: Model tried to call unavailable tool 'edit'`) is not a tool the client has and is left out."""
     names = []
+    calls = []          # (name, call id)
+    results = {}        # call id -> the text of its result
     for message in req.get("messages") or []:
-        if not isinstance(message, dict) or message.get("role") != "assistant":
+        if not isinstance(message, dict):
             continue
-        for call in message.get("tool_calls") or []:
-            names.append((call.get("function") or {}).get("name") if isinstance(call, dict) else None)
+        if message.get("role") == "tool":
+            results[message.get("tool_call_id")] = _result_text(message.get("content"))
         content = message.get("content")
         for block in content if isinstance(content, list) else []:
+            if isinstance(block, dict) and block.get("type") == "tool_result":
+                results[block.get("tool_use_id")] = _result_text(block.get("content"))
+        if message.get("role") != "assistant":
+            continue
+        for call in message.get("tool_calls") or []:
+            calls.append(((call.get("function") or {}).get("name") if isinstance(call, dict) else None,
+                          call.get("id") if isinstance(call, dict) else None))
+        for block in content if isinstance(content, list) else []:
             if isinstance(block, dict) and block.get("type") == "tool_use":
-                names.append(block.get("name"))
+                calls.append((block.get("name"), block.get("id")))
     items = req.get("input")
     for item in items if isinstance(items, list) else []:
+        if isinstance(item, dict) and item.get("type") in ("function_call_output", "custom_tool_call_output"):
+            results[item.get("call_id")] = _result_text(item.get("output"))
         if isinstance(item, dict) and item.get("type") in ("function_call", "custom_tool_call"):
             name = item.get("name")
             if isinstance(name, str) and name and isinstance(item.get("namespace"), str) and item["namespace"]:
                 name = f"{item['namespace']}.{name}"
+            calls.append((name, item.get("call_id")))
+    kept = {}
+    for name, call_id in calls:
+        refused = call_id is not None and call_id in results and _refusal(results[call_id])
+        kept[name] = kept.get(name, False) or not refused
+    for name, _ in calls:
+        if kept.get(name) and name not in names:
             names.append(name)
     return names
+
+
+def _result_text(content) -> str:
+    """The text of a tool result in any of the routes' shapes (a string, or a list of text parts)."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return " ".join(p.get("text", "") if isinstance(p, dict) else str(p) for p in content)
+    return ""
+
+
+_REFUSAL = re.compile(r"NoSuchTool|rejected before execution|unavailable tool|unknown tool|no such tool|tool '?[\w.:-]+'? (?:does not exist|is not available|not found)",
+                      re.IGNORECASE)
+
+
+def _refusal(text: str) -> bool:
+    """#6120: a tool result in which the client says the tool called does not exist (so the call never ran)."""
+    return bool(_REFUSAL.search(text or ""))
 
 
 def with_history_tools(tools, req) -> list:
